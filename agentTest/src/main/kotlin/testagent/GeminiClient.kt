@@ -13,6 +13,13 @@ class GeminiClient(
     private val model: String = "gemini-3.6-flash",
 ) : LlmClient {
 
+    override var callCount: Int = 0
+        private set
+    override var inputTokens: Long = 0
+        private set
+    override var outputTokens: Long = 0
+        private set
+
     private val http = OkHttpClient.Builder()
         .connectTimeout(Duration.ofSeconds(30))
         .readTimeout(Duration.ofMinutes(3))
@@ -49,7 +56,14 @@ class GeminiClient(
             val text = resp.body?.string() ?: error("Empty response from Gemini API")
             if (!resp.isSuccessful) error("Gemini API error ${resp.code}: ${text.take(500)}")
 
-            val parts = JSONObject(text)
+            callCount++
+            val root = JSONObject(text)
+            root.optJSONObject("usageMetadata")?.let { u ->
+                inputTokens += u.optLong("promptTokenCount", 0)
+                outputTokens += u.optLong("candidatesTokenCount", 0)
+            }
+
+            val parts = root
                 .getJSONArray("candidates")
                 .getJSONObject(0)
                 .getJSONObject("content")

@@ -51,6 +51,9 @@ abstract class AgentTestTask : DefaultTask() {
     @get:Input
     abstract val maxMutants: Property<Int>
 
+    @get:Input
+    abstract val maxLlmCalls: Property<Int>
+
     // Captured at configuration time (configuration-cache friendly)
     @get:Internal
     val moduleDir: File = project.projectDir
@@ -62,12 +65,13 @@ abstract class AgentTestTask : DefaultTask() {
     val modulePath: String = project.path
 
     init {
-        maxRepairAttempts.convention(3)
+        maxRepairAttempts.convention(2) // compile-fix retries only
         llmProvider.convention("auto")
         advise.convention(false)
         strict.convention(false)
         mutate.convention(false)
         maxMutants.convention(8)
+        maxLlmCalls.convention(15)
         outputs.upToDateWhen { false } // always re-run when invoked
     }
 
@@ -150,6 +154,12 @@ abstract class AgentTestTask : DefaultTask() {
         }
 
         printSummary(results)
+        if (llm.callCount > 0) {
+            logger.lifecycle(
+                "💰 LLM usage: ${llm.callCount} call(s) · " +
+                    "%,d in / %,d out tokens".format(llm.inputTokens, llm.outputTokens)
+            )
+        }
 
         val problems = results.count {
             it.status == Status.ERROR || it.status == Status.COMPILE_FAILED || it.status == Status.FAILED_TESTS
@@ -251,18 +261,21 @@ abstract class AgentTestTask : DefaultTask() {
         writeTestFile(testFile, testCode, sourceHash, "untested")
         logger.lifecycle("📝 Wrote ${testFile.relativeTo(moduleDir)}")
 
-        val maxAttempts = maxRepairAttempts.get()
+        val maxCompileFixes = maxRepairAttempts.get()
         var lastUnresolved: Set<String> = emptySet()
+        var compileFixesUsed = 0
 
-        for (attempt in 1..maxAttempts) {
-            logger.lifecycle("🧪 Running tests (attempt $attempt/$maxAttempts)...")
+        while (true) {
+            logger.lifecycle("🧪 Running tests...")
             JUnitXmlParser.clearStaleResults(resultsDir, testClassName)
-            val logFile = runGradleTests("$pkg.$testClassName", simpleName, attempt)
+            val logFile = runGradleTests("$pkg.$testClassName", simpleName, compileFixesUsed + 1)
             val result = JUnitXmlParser.parse(resultsDir, testClassName)
 
-            // No XML at all → almost certainly a compilation failure
+            // No XML at all → almost certainly a compilation failure.
+            // Compile fixes are the ONLY retries — a compilable file is required
+            // for the pipeline to produce any verdict at all.
             if (result.total == 0) {
-                val logTail = logFile.readText().takeLast(4000)
+                val logTail = logFile.readText().takeLast(2500)
 
                 // Guard: are the compile errors actually in OUR file?
                 val errorLines = logTail.lines().filter { it.trimStart().startsWith("e:") }
@@ -276,15 +289,16 @@ abstract class AgentTestTask : DefaultTask() {
                     )
                 }
 
-                logger.lifecycle("💥 Compile error in generated test. Repairing...")
-                if (attempt == maxAttempts) {
+                if (compileFixesUsed >= maxCompileFixes) {
                     writeTestFile(testFile, testCode, sourceHash, "broken")
                     return PipelineResult(
                         fqcn, Status.COMPILE_FAILED,
-                        "Generated test failed to compile after $maxAttempts attempts. See $logFile",
+                        "Generated test failed to compile after $maxCompileFixes fix attempt(s). See $logFile",
                         testFile,
                     )
                 }
+                compileFixesUsed++
+                logger.lifecycle("💥 Compile error — fix attempt $compileFixesUsed/$maxCompileFixes...")
 
                 // Hallucination circuit breaker: same unresolved API failing twice
                 // means the API does not exist — force a strategy change.
@@ -297,10 +311,9 @@ abstract class AgentTestTask : DefaultTask() {
 
                     CRITICAL: The following APIs DO NOT EXIST — they have now failed
                     twice: ${repeated.joinToString()}. Do NOT retry variations of them.
-                    Restructure the tests to avoid those APIs entirely — test only
-                    behaviors reachable through the class's public parameters. If a
-                    behavior cannot be tested without those APIs, drop that test and
-                    add: // UNTESTABLE: <reason>
+                    Restructure the tests to avoid those APIs entirely. If a behavior
+                    cannot be tested without those APIs, drop that test and add:
+                    // UNTESTABLE: <reason>
                     """.trimIndent()
                 } else ""
 
@@ -312,6 +325,9 @@ abstract class AgentTestTask : DefaultTask() {
                 continue
             }
 
+            // Compilable suite → run once, report honestly. NO repair of failing
+            // tests: a failure is information (possibly a genuine source bug),
+            // not something to iterate away — and every repair cycle costs tokens.
             printCaseResults(result, testFile)
 
             if (result.passed) {
@@ -320,11 +336,9 @@ abstract class AgentTestTask : DefaultTask() {
                 val mode = if (incremental) " (incremental update)" else ""
                 var detail = "${result.total} tests passed$mode"
 
-                // Surface SUSPECTED CODE BUG markers left by the repair loop
                 val bugMarkers = testFile.readLines().count { it.contains("SUSPECTED CODE BUG") }
                 if (bugMarkers > 0) detail += " · 🐛 $bugMarkers suspected source bug(s) flagged in test file"
 
-                // Mutation analysis — trust score for the suite (opt-in, non-Compose)
                 if (mutate.get()) {
                     detail += if (target.kind == Kind.COMPOSE) {
                         " · 🧬 mutation n/a for Compose targets"
@@ -335,27 +349,15 @@ abstract class AgentTestTask : DefaultTask() {
                 return PipelineResult(fqcn, Status.PASSED, detail, testFile)
             }
 
-            logger.lifecycle("❌ ${result.failed.size}/${result.total} tests failed")
-
-            if (attempt == maxAttempts) {
-                writeTestFile(testFile, testCode, sourceHash, "failed")
-                return PipelineResult(
-                    fqcn, Status.FAILED_TESTS,
-                    "${result.failed.size}/${result.total} failing after $maxAttempts attempts — " +
-                        "possible genuine bug in $simpleName (agent never modifies source)",
-                    testFile,
-                )
-            }
-
-            logger.lifecycle("🔧 Asking ${llm.javaClass.simpleName} to repair the failing tests...")
-            testCode = generateValidated(
-                llm, target.kind,
-                repairPrompt(sourceCode, testCode, result, target.kind),
+            writeTestFile(testFile, testCode, sourceHash, "failed")
+            logger.lifecycle("❌ ${result.failed.size}/${result.total} tests failed — see FAILS above")
+            return PipelineResult(
+                fqcn, Status.FAILED_TESTS,
+                "${result.failed.size}/${result.total} failed — failures may indicate genuine source bugs; " +
+                    "review FAILS above (agent never modifies source, and does not rewrite failing tests)",
+                testFile,
             )
-            writeTestFile(testFile, testCode, sourceHash, "untested")
         }
-
-        return PipelineResult(fqcn, Status.ERROR, "Unexpected pipeline exit", testFile)
     }
 
     // ---------- mutation analysis (suite trust score) ----------
@@ -642,6 +644,9 @@ abstract class AgentTestTask : DefaultTask() {
     private fun generateValidated(llm: LlmClient, kind: Kind, prompt: String, maxValidationRetries: Int = 2): String {
         var currentPrompt = prompt
         repeat(maxValidationRetries + 1) { attempt ->
+            if (llm.callCount >= maxLlmCalls.get()) {
+                error("LLM call budget exhausted (${maxLlmCalls.get()} calls this run) — raise maxLlmCalls in the agentTest config or split the run")
+            }
             val code = stripFences(llm.complete(systemPromptFor(kind), currentPrompt))
             val violation = validateGeneratedCode(code, kind)
             if (violation == null) return code
@@ -657,7 +662,7 @@ abstract class AgentTestTask : DefaultTask() {
                 ${structureReminder(kind)}
 
                 Previous answer:
-                ${code.take(6000)}
+                ${code.take(3000)}
             """.trimIndent()
         }
         error("unreachable")
@@ -743,16 +748,24 @@ abstract class AgentTestTask : DefaultTask() {
     }
 
     private fun printCaseResults(result: TestRunResult, testFile: File) {
+        // Compact summary — one line per test, passes first, no links
         result.cases.sortedBy { it.failure != null }.forEach { case ->
-            val line = findTestLine(testFile, case.name)
-            val link = "file://${testFile.absolutePath}" + (line?.let { ":$it" } ?: "")
-            if (case.failure == null) {
-                logger.lifecycle("   ✅ PASS  ${case.name}")
-            } else {
-                logger.lifecycle("   ❌ FAIL  ${case.name}")
-                logger.lifecycle("            ${case.failure.message.take(200)}")
+            val icon = if (case.failure == null) "✅ PASS" else "❌ FAIL"
+            logger.lifecycle("   $icon  ${case.name}")
+        }
+
+        // Detailed FAILS section — message + clickable link per failure
+        val fails = result.cases.filter { it.failure != null }
+        if (fails.isNotEmpty()) {
+            logger.lifecycle("")
+            logger.lifecycle("   FAILS")
+            fails.forEach { case ->
+                val line = findTestLine(testFile, case.name)
+                val link = "file://${testFile.absolutePath}" + (line?.let { ":$it" } ?: "")
+                logger.lifecycle("   ${case.name}")
+                logger.lifecycle("      ${case.failure!!.message.take(300)}")
+                logger.lifecycle("      $link")
             }
-            logger.lifecycle("            $link")
         }
     }
 
@@ -914,6 +927,13 @@ abstract class AgentTestTask : DefaultTask() {
               advance generously past (delay + animation duration)
             - No Mockito/MockK
             - Skip private composables and pure preview functions
+            - LAYER BOUNDARY: if a composable creates its own ViewModel internally
+              (e.g. viewModel(), hiltViewModel(), or a default ViewModel parameter),
+              do NOT test network/async success paths at the UI layer — real
+              repositories cannot run in this JVM test environment and callbacks
+              will never fire. Those behaviors belong to the ViewModel's own tests.
+              At the UI layer test ONLY: rendering, text display, input entry,
+              validation error display, and synchronous callbacks (back/navigation)
             - Every test must have a meaningful assertion
 
             Source file:
@@ -1029,7 +1049,7 @@ abstract class AgentTestTask : DefaultTask() {
             ${structureReminder(kind)}
 
             Failures:
-            ${result.failed.joinToString("\n\n") { "• ${it.testName}\n  ${it.message}\n  ${it.stackTrace.take(600)}" }}
+            ${result.failed.joinToString("\n\n") { "• ${it.testName}\n  ${it.message}\n  ${it.stackTrace.take(300)}" }}
 
             Current test file:
             $testCode

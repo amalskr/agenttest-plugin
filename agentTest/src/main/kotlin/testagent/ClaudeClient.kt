@@ -13,6 +13,13 @@ class ClaudeClient(
     private val model: String = "claude-sonnet-4-6",
 ) : LlmClient {
 
+    override var callCount: Int = 0
+        private set
+    override var inputTokens: Long = 0
+        private set
+    override var outputTokens: Long = 0
+        private set
+
     private val http = OkHttpClient.Builder()
         .connectTimeout(Duration.ofSeconds(30))
         .readTimeout(Duration.ofMinutes(3))
@@ -46,7 +53,14 @@ class ClaudeClient(
             val text = resp.body?.string() ?: error("Empty response from Claude API")
             if (!resp.isSuccessful) error("Claude API error ${resp.code}: ${text.take(500)}")
 
-            val content = JSONObject(text).getJSONArray("content")
+            callCount++
+            val root = JSONObject(text)
+            root.optJSONObject("usage")?.let { u ->
+                inputTokens += u.optLong("input_tokens", 0)
+                outputTokens += u.optLong("output_tokens", 0)
+            }
+
+            val content = root.getJSONArray("content")
             return (0 until content.length())
                 .map { content.getJSONObject(it) }
                 .filter { it.getString("type") == "text" }

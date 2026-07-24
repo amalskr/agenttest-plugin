@@ -3,7 +3,7 @@
   "component": {
     "group": "com.ceylonapz",
     "module": "agentTest",
-    "version": "1.1.0",
+    "version": "1.2.1",
     "attributes": {
       "org.gradle.status": "release"
     }
@@ -27,13 +27,13 @@
       },
       "files": [
         {
-          "name": "agentTest-1.1.0.jar",
-          "url": "agentTest-1.1.0.jar",
-          "size": 81519,
-          "sha512": "a7bb3fa16d81d29ad0fdff52e1fb6d6f77450eadf43710477640c69dd4f661ad9cc01f4501828b1181a6b7c4a620667dd6ca9eb2225c16058ef65cc36acaa61a",
-          "sha256": "62617d660644923e3b7a3fb8ce48e1ab28c04eb269c887db3296c8ff0cff3652",
-          "sha1": "0f62b5dd9e9c8d945d1fd36ced6a7cb2e4b879b1",
-          "md5": "c1db8f933412b0dbdb52378e2bad5059"
+          "name": "agentTest-1.2.1.jar",
+          "url": "agentTest-1.2.1.jar",
+          "size": 83206,
+          "sha512": "f0d133269b2da76b41c228bfc0e45b70d6e9bcd9b4da0cf95b2d41ef7feaecc0c9abb8770ccc17c7d479183dde84ac359f43b7de0b9a36f2a5b1aa032d96b9eb",
+          "sha256": "2e6d7ef04a585e53f4cc9cae988204cef95926c165b9cf72c725094b4da36b09",
+          "sha1": "d8646764adb3ff997dd408cda9ac24d6456dd567",
+          "md5": "1bc7cad9361492cbc39965fcb6e84cb2"
         }
       ]
     },
@@ -66,13 +66,13 @@
       ],
       "files": [
         {
-          "name": "agentTest-1.1.0.jar",
-          "url": "agentTest-1.1.0.jar",
-          "size": 81519,
-          "sha512": "a7bb3fa16d81d29ad0fdff52e1fb6d6f77450eadf43710477640c69dd4f661ad9cc01f4501828b1181a6b7c4a620667dd6ca9eb2225c16058ef65cc36acaa61a",
-          "sha256": "62617d660644923e3b7a3fb8ce48e1ab28c04eb269c887db3296c8ff0cff3652",
-          "sha1": "0f62b5dd9e9c8d945d1fd36ced6a7cb2e4b879b1",
-          "md5": "c1db8f933412b0dbdb52378e2bad5059"
+          "name": "agentTest-1.2.1.jar",
+          "url": "agentTest-1.2.1.jar",
+          "size": 83206,
+          "sha512": "f0d133269b2da76b41c228bfc0e45b70d6e9bcd9b4da0cf95b2d41ef7feaecc0c9abb8770ccc17c7d479183dde84ac359f43b7de0b9a36f2a5b1aa032d96b9eb",
+          "sha256": "2e6d7ef04a585e53f4cc9cae988204cef95926c165b9cf72c725094b4da36b09",
+          "sha1": "d8646764adb3ff997dd408cda9ac24d6456dd567",
+          "md5": "1bc7cad9361492cbc39965fcb6e84cb2"
         }
       ]
     }

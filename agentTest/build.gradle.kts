@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "com.ceylonapz"
-version = "1.1.0"
+version = "1.2.1"
 
 kotlin {
     jvmToolchain(17)
