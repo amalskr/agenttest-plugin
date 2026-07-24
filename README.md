@@ -1,28 +1,68 @@
-# AgentTest v10 — standalone Gradle plugin
+# AgentTest
 
-Same agent as v3 (git auto-discovery, deterministic triage, generate → run →
-repair loop, Gemini + Claude), now packaged as a named **included build** —
-`agentTest/` — instead of the magic `buildSrc` folder.
+**AI-powered test generation agent for Android — writes the tests, proves they work, finds your bugs.**
 
-Benefits over buildSrc:
-- Any folder name you like
-- Changing agent code does NOT invalidate your whole build cache (buildSrc does)
-- Reusable: drop the same folder into any project (AtharaMaga, Soho, ...)
-- Task auto-registers via the plugin — no tasks.register block needed
+AgentTest is a Gradle plugin that detects what changed in your project via git, decides *how* each file should be tested (JUnit / Compose UI / ViewModel), generates the tests with an LLM (Gemini or Claude), runs them, and reports honest per-test PASS/FAIL results — all from one command:
 
-## Install (3 steps)
+```bash
+./gradlew :app:agentTest
+```
 
-1. **Delete the old `buildSrc/` folder** (if you added it in v2/v3) and remove
-   the old `tasks.register<testagent.AgentTestTask>("agentTest")` block from
-   `app/build.gradle.kts`.
+Unlike chat-based test generation, AgentTest is a **verified pipeline**: every generated suite is compiled, executed, and reported with real results. Deterministic guards catch LLM hallucinations before they waste a build, a static-analysis planner guarantees boundary coverage, metamorphic tests catch real state-loss bugs, and an optional mutation engine scores how strong your suite actually is.
 
-2. Copy the `agentTest/` folder into your **project root**, then register it in
-   your root `settings.gradle.kts` — inside `pluginManagement`:
+---
+
+## Highlights
+
+- 🔍 **Git-aware auto-discovery** — no arguments needed; changed/new files are found automatically
+- 🎯 **Deterministic triage** — pure Kotlin → JUnit, `@Composable` → Robolectric Compose UI tests, `ViewModel` → coroutines-test; Activities/Fragments are skipped with a reason (zero LLM calls to decide)
+- 📋 **Static-analysis test planning** — function signatures, nullability, `when` branches, message literals, and numeric boundaries are extracted deterministically and injected as a minimum coverage contract
+- 🔄 **Metamorphic state-restoration tests** — stateful composables automatically get `StateRestorationTester` tests that catch `remember` vs `rememberSaveable` data-loss bugs (a real, non-crashing defect class)
+- 🧬 **Mutation trust score** (`--mutate`) — a built-in source-level mutation engine scores your suite ("15 tests, mutation score 87%") and asks the LLM to strengthen it against blind spots
+- ⏩ **Incremental engine** — unchanged sources are skipped (zero LLM calls); changed sources get incremental updates that preserve passing tests and add coverage for the git diff only
+- ✅ **Honest reporting** — failing tests are *reported*, never silently "repaired" away; a failure may be a genuine source bug (AgentTest has found real ones)
+- 🛡️ **Hallucination guards** — forbidden-import validation before any build, a circuit breaker for non-existent APIs, and compile-fix retries with structure reminders
+- 💰 **Cost telemetry & budget cap** — every run prints real token usage; `maxLlmCalls` hard-stops runaway spending
+- 🔌 **Multi-provider** — Gemini (`gemini-3.6-flash`) and Claude (`claude-sonnet-4-6`), auto-detected from whichever key you set
+
+---
+
+## Requirements
+
+- Android project with Gradle Kotlin DSL (`build.gradle.kts`)
+- JDK 17+ available to Gradle
+- `git` on PATH (for auto-discovery mode)
+- A Gemini or Anthropic API key
+- For Compose UI test generation: Robolectric + Compose test dependencies (the agent tells you exactly what to add if missing — see [One-time setup](#one-time-setup-per-project))
+
+---
+
+## Installation
+
+AgentTest is distributed as a compiled Gradle plugin — **no agent source code lives in your project.**
+
+### Step 1 — Publish the plugin to your machine (one time)
+
+```bash
+cd /path/to/agenttest-plugin/agentTest
+gradle publishToMavenLocal
+```
+
+Verify:
+
+```bash
+ls ~/.m2/repository/com/ceylonapz/
+# → agenttest ...
+```
+
+### Step 2 — Add it to any project (2 lines)
+
+**Root `settings.gradle.kts`** — add `mavenLocal()` as the FIRST repository inside `pluginManagement`:
 
 ```kotlin
 pluginManagement {
-    includeBuild("agentTest")   // <-- add this line
     repositories {
+        mavenLocal()          // ← add this line first
         google()
         mavenCentral()
         gradlePluginPortal()
@@ -30,235 +70,273 @@ pluginManagement {
 }
 ```
 
-3. Apply the plugin in `app/build.gradle.kts`:
+**Module `app/build.gradle.kts`** — apply the plugin:
 
 ```kotlin
 plugins {
-    id("com.android.application")
+    alias(libs.plugins.android.application)
     // ... your existing plugins ...
-    id("com.ceylonapz.agenttest")   // <-- add this
+    id("com.ceylonapz.agenttest") version "1.2.1"   // ← add this line
 }
 ```
 
-Sync. The `agentTest` task appears under app → Tasks → verification.
+Sync. The `agentTest` task appears under **app → Tasks → verification**.
 
-## API key
+### Step 3 — API key
 
-```bash
-export GEMINI_API_KEY=...       # Gemini (gemini-3.6-flash)
+Add your key to the project root `local.properties` (gitignored by default in Android projects — never commit keys):
+
+```properties
+GEMINI_API_KEY=your-key
 # or
-export ANTHROPIC_API_KEY=...    # Claude (claude-sonnet-4-6)
+ANTHROPIC_API_KEY=your-key
 ```
 
-## Usage
+Environment variables also work and take priority. If both providers are configured, Gemini is preferred unless you pass `--llm=claude`.
 
-```bash
-# AUTO MODE: discovers testable classes from git diff + untracked files
-./gradlew :app:agentTest --llm=gemini
+---
 
-# EXPLICIT MODE: one specific class
-./gradlew :app:agentTest --target=com.example.MyClass --llm=gemini
+## One-time setup per project
+
+**Recommended for all projects** — protects Robolectric from unsupported-SDK crashes:
+
+Create `app/src/test/resources/robolectric.properties`:
+
+```properties
+sdk=34
 ```
 
-## How auto mode decides (deterministic triage — zero LLM calls)
+**For Compose UI test targets** (the agent preflights these and prints paste-ready lines if missing):
 
-| File looks like            | Decision                                    |
-|----------------------------|---------------------------------------------|
-| `*GeneratedTest.kt`        | ⏭️ skip (agent's own output)                 |
-| Contains `@Composable`     | ⏭️ skip — needs Compose UI test              |
-| Extends Activity/Fragment  | ⏭️ skip — needs UI/instrumented test         |
-| Imports `android.*`        | ⏭️ skip — not JVM-testable (extract logic!)  |
-| Pure Kotlin class/object   | 🎯 TARGET                                    |
-
-## Pipeline per target
-
-1. Generate JUnit 4 tests via LLM
-2. Deterministic guard: forbidden imports rejected BEFORE any build
-3. Nested `testDebugUnitTest --tests <filter>` run (separate project-cache-dir)
-4. JUnit XML parsing
-5. Compile errors → foreign-error guard, then repair loop (max 3)
-6. Persistent failures → flagged as possible genuine source bug
-7. Multi-target summary
-
-Outputs: `app/src/test/java/<pkg>/<Class>GeneratedTest.kt`,
-logs at `app/build/agenttest/run-<Class>-N.log`.
-Grep generated tests for `// SUSPECTED CODE BUG:` markers.
-
-## New in v5
-
-### Per-test PASS/FAIL report with clickable links
-
-Instead of a bare "All N tests passed", every test is listed individually:
-
-```
-   ✅ PASS  validateEmail_emptyEmail_returnsRequiredError
-            file:///.../LoginValidatorGeneratedTest.kt:11
-   ❌ FAIL  validatePassword_fiveCharacters_returnsMinLengthError
-            expected:<...> but was:<...>
-            file:///.../LoginValidatorGeneratedTest.kt:62
+```kotlin
+// app/build.gradle.kts
+android {
+    testOptions { unitTests { isIncludeAndroidResources = true } }
+}
+dependencies {
+    testImplementation("org.robolectric:robolectric:4.14.1")
+    testImplementation(platform(libs.androidx.compose.bom))
+    testImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
+}
 ```
 
-The `file://...:line` links are clickable in the Android Studio Build/Run
-console — clicking jumps straight to that test method in the file.
+**For ViewModel targets:**
 
-### Refactoring advice for skipped UI files (--advise)
-
-When a skipped Composable/Activity contains embedded logic (detected
-deterministically: validation regexes, when-tables, length rules, comparisons),
-it is flagged:
-
-```
-⏭️  Skipping LoginScreen — Composable (needs Compose UI test) ⚠️ embedded logic detected
-💡 1 skipped file(s) contain embedded logic... Re-run with --advise for concrete refactoring plans.
-```
-
-Run with `--advise` and the agent writes a full extraction plan per file to
-`build/agenttest/advice-<Class>.md`: what logic is trapped in the UI, a
-ready-to-paste pure-Kotlin extracted class, the exact UI diff, and what
-becomes testable afterwards.
-
-```bash
-./gradlew :app:agentTest --llm=gemini --advise
-```
-
-## New in v6 — the agent decides the test strategy itself
-
-Triage no longer skips Compose files. Each changed file is classified
-deterministically and tested with the right strategy:
-
-| File contains                  | Agent's decision                              |
-|--------------------------------|-----------------------------------------------|
-| Pure Kotlin class/object       | 🎯 JUnit unit tests                            |
-| public @Composable functions   | 🎯 Compose UI tests (Robolectric, JVM, no emulator) |
-| Activity/Fragment subclass     | ⏭️ skip (needs instrumented test)              |
-| android.* non-UI dependency    | ⏭️ skip (advice candidate)                     |
-
-Compose test generation covers user-visible behavior autonomously: initial
-state, inputs → error messages, clicks → callbacks, and displayed parameters
-verified with TWO different values (proves nothing is hardcoded).
-
-One-time setup for Compose targets is preflight-checked deterministically —
-if deps are missing, the agent prints paste-ready lines instead of failing
-with a cryptic compile error:
-
-```
-🔧 com.ceylonapz.hotfixagent.LoginSuccessScreen
-   Compose UI testing needs one-time setup in app/build.gradle.kts:
-      testImplementation("org.robolectric:robolectric:4.14.1")
-      testImplementation("androidx.compose.ui:ui-test-junit4") // + compose BOM
-      debugImplementation("androidx.compose.ui:ui-test-manifest")
-      android { testOptions { unitTests { isIncludeAndroidResources = true } } }
-```
-
-Add those once, re-run, and Compose screens get tested automatically from then on.
-
-## New in v7 — ViewModel support
-
-Triage now recognizes ViewModels as a third strategy:
-
-| File contains                  | Agent's decision                              |
-|--------------------------------|-----------------------------------------------|
-| Pure Kotlin class/object       | 🎯 JUnit unit tests                            |
-| extends ViewModel              | 🎯 ViewModel tests (kotlinx-coroutines-test)   |
-| public @Composable functions   | 🎯 Compose UI tests (Robolectric)              |
-| Activity/Fragment subclass     | ⏭️ skip (needs instrumented test)              |
-
-ViewModel test generation handles:
-- Dispatchers.setMain / resetMain scaffolding with StandardTestDispatcher
-- runTest + advanceUntilIdle() before state assertions
-- StateFlow/LiveData state-transition testing per public function
-- Inline FAKE implementations for interface dependencies (never mocking libraries)
-
-One-time setup (preflight-checked, paste-ready if missing):
-
-```
+```kotlin
 testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
 ```
 
-## New in v8 — incremental testing (the agent tests only what changed)
+**.gitignore** — if you ever use the plugin as an included build, ignore its outputs:
 
-Every generated test file now carries a state header on line 1:
-
-```kotlin
-// agenttest: hash=<source-sha> status=passed
+```
+agentTest/build/
+agentTest/.gradle/
 ```
 
-That single line makes the agent stateful with zero external databases:
+---
 
-| Situation                                        | Agent behavior                                   |
-|--------------------------------------------------|--------------------------------------------------|
-| Test exists, status=passed, source hash UNCHANGED | ⏩ skipped — "up to date"                         |
-| Test exists, status=passed, source hash CHANGED   | ♻️ INCREMENTAL — preserve passing tests, add tests for the git diff only |
-| Test exists but broken/failed                     | 🧹 deleted, full regeneration                     |
-| No test                                           | Full generation                                   |
+## How to use
 
-Incremental updates feed the LLM: the existing (passing) tests, a `git diff -U0`
-of exactly what changed, and the current source — with strict instructions to
-preserve passing tests verbatim and add only delta coverage.
+### Daily workflow — auto mode
 
-`--target=...` always forces regeneration (your "re-run this one" escape hatch).
-
-### Also in v8
-
-- **Hallucination circuit breaker**: if the same unresolved API fails in two
-  consecutive compile attempts, the repair prompt escalates — "this API does
-  not exist, restructure without it" — instead of looping on variations.
-- **Structure reminders in every repair/compile-fix prompt**: repairs no longer
-  drop createComposeRule, @Config, or dispatcher setup (a recurring failure).
-- **Compose prompt hardening** from real failures: onAllNodesWithText for text
-  that legitimately appears in multiple nodes ("found 2 nodes" fix), mainClock
-  guidance that accounts for AnimatedVisibility exit durations, assertExists
-  preference, below-the-fold scrolling.
-- **Module-scoped discovery**: only this module's src/main is targeted — the
-  agent can no longer try to test its own plugin code.
-- **Header-aware pre-clean**: broken generated tests are removed up front;
-  passing suites are kept for incremental mode.
-
-Recommended one-time setup: `app/src/test/resources/robolectric.properties`
-containing `sdk=34` (protects against Robolectric max-SDK crashes even if the
-LLM drops the @Config annotation).
-
-## New in v9 — lenient by default, --strict for CI
-
-Failing generated tests no longer fail the build. The agent's job is to
-generate, run, and REPORT — deciding what to do about failures is yours.
+Finish a feature, then run with no arguments:
 
 ```bash
-# Local dev (default): full summary, BUILD SUCCESSFUL even with failures
-./gradlew :app:agentTest --llm=gemini
-#   ⚠️  1 target(s) need attention (build not failed — use --strict for CI)
-
-# CI mode: any COMPILE_FAILED / FAILED_TESTS / ERROR fails the build
-./gradlew :app:agentTest --llm=gemini --strict
+./gradlew :app:agentTest
 ```
+
+The agent:
+1. Reads `git diff HEAD` + untracked files
+2. Triages each changed `.kt` file in this module's `src/main`
+3. Skips up-to-date targets (⏩), incrementally updates changed ones (♻️), fully generates new ones
+4. Runs everything and prints per-test results + a summary
+
+```
+🔍 No --target given — auto-detecting from git changes...
+⏭️  Skipping MainActivity — Activity/Fragment (needs instrumented test)
+🎯 Targets:
+   • com.example.LoginValidator  →  JUnit unit test
+   • com.example.LoginViewModel  →  ViewModel test (coroutines-test)
+   • com.example.LoginScreen     →  Compose UI test (Robolectric)
+
+━━━ com.example.LoginValidator [UNIT] ━━━
+📋 Static analysis plan: 14 coverage items derived
+🤖 Generating JUnit tests with GeminiClient...
+📝 Wrote src/test/java/com/example/LoginValidatorGeneratedTest.kt
+🧪 Running tests...
+   ✅ PASS  validateEmail_emptyEmail_returnsRequiredError
+   ✅ PASS  validatePassword_sixCharacters_returnsNull
+   ❌ FAIL  validateEmail_uppercaseEmail_returnsNull
+
+   FAILS
+   validateEmail_uppercaseEmail_returnsNull
+      expected:<null> but was:<Enter a valid email address>
+      file:///.../LoginValidatorGeneratedTest.kt:52
+
+━━━━━━━━━━ agentTest summary ━━━━━━━━━━
+✅ com.example.LoginValidator
+   15 tests passed
+⏩ com.example.NetworkStatus
+   up to date — use --target=... to force regeneration
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💰 LLM usage: 2 call(s) · 6,183 in / 2,098 out tokens
+```
+
+### Test one specific class (forces regeneration)
+
+```bash
+./gradlew :app:agentTest --target=com.example.LoginValidator
+```
+
+Explicit mode bypasses the up-to-date skip — use it to force a fresh suite, test committed (unchanged) code, or demo.
+
+### Mutation trust score
+
+```bash
+./gradlew :app:agentTest --target=com.example.LoginValidator --mutate
+```
+
+```
+🧬 Mutation analysis: 8 mutant(s), one nested test run each...
+   💀 killed    L12 '<' → '<=': password.length < MIN_PASSWORD_LENGTH
+   🚨 SURVIVED  L8 6 → 7: const val MIN_PASSWORD_LENGTH = 6
+🧬 1 survivor(s) — asking GeminiClient to strengthen the suite...
+   💪 strengthened suite passes (17 tests) — re-running survivors...
+   💀 now killed L8 6 → 7
+✅ com.example.LoginValidator
+   17 tests passed · 🧬 mutation score 8/8 (100%) after strengthening
+```
+
+Each mutant is one nested test run (~20-40s), which is why `--mutate` is opt-in. Your source files are always restored — mutants never leak into the working tree.
+
+### CI mode
+
+```bash
+./gradlew :app:agentTest --strict
+```
+
+By default, failing generated tests do **not** fail the build (they're reported with a ⚠️ note — reviewing failures is your job, and a failure may be a real bug). `--strict` makes any COMPILE_FAILED / FAILED_TESTS / ERROR fail the build, for CI pipelines.
+
+### Architecture advice for untestable UI files
+
+```bash
+./gradlew :app:agentTest --advise
+```
+
+Skipped UI files that contain embedded business logic (validation regexes, decision tables, length rules) get a concrete refactoring plan written to `build/agenttest/advice-<Class>.md`: what logic is trapped in the UI, a ready-to-paste extracted pure-Kotlin class, the exact UI diff, and what becomes testable.
+
+### Choose the LLM provider
+
+```bash
+./gradlew :app:agentTest --llm=gemini
+./gradlew :app:agentTest --llm=claude
+```
+
+### One-click runs from Android Studio (no terminal)
+
+**Run → Edit Configurations → + → Gradle**, set Run to `:app:agentTest`, name it (e.g. `🤖 AgentTest`), save. It now lives in the ▶ dropdown next to your app configuration. The Gradle panel double-click (app → verification → agentTest) also works.
+
+---
 
 ## All options
 
-| Option            | Default | Purpose                                          |
-|-------------------|---------|--------------------------------------------------|
-| `--target=<fqcn>` | (auto)  | Test one class; forces regeneration              |
-| `--llm=gemini\|claude` | auto  | Provider selection (env-key auto-detect)     |
-| `--advise`        | off     | Extraction plans for UI files w/ embedded logic  |
-| `--strict`        | off     | Fail build on any target failure (CI)            |
+| Option | Default | Purpose |
+|---|---|---|
+| `--target=<fqcn>` | (auto) | Test one class; bypasses up-to-date skip |
+| `--llm=gemini\|claude` | auto | Provider selection (env/local.properties key auto-detect) |
+| `--mutate` | off | Mutation analysis + suite strengthening after pass |
+| `--advise` | off | Refactoring plans for UI files with embedded logic |
+| `--strict` | off | Fail the build on any target failure (CI) |
 
-## New in v10 — hidden code, no-terminal workflow
+Configurable properties (in `app/build.gradle.kts`):
 
-### API key in local.properties (no more export)
-Add to your project root `local.properties` (already gitignored in Android projects):
+```kotlin
+tasks.named<testagent.AgentTestTask>("agentTest") {
+    maxRepairAttempts.set(2)   // compile-fix retries (default 2)
+    maxMutants.set(8)          // mutants per --mutate run (default 8)
+    maxLlmCalls.set(15)        // hard budget cap per run (default 15)
+}
 ```
-GEMINI_API_KEY=your-key
+
+---
+
+## How the agent decides (deterministic triage)
+
+Each changed `.kt` file under this module's `src/main` is classified with zero LLM calls:
+
+| File contains | Decision |
+|---|---|
+| Pure Kotlin class/object | 🎯 JUnit unit tests |
+| extends `ViewModel` | 🎯 ViewModel tests (kotlinx-coroutines-test, inline fakes — no mocking libraries) |
+| public `@Composable` functions | 🎯 Compose UI tests (Robolectric — JVM, no emulator) |
+| Activity/Fragment subclass | ⏭️ skip (needs instrumented test) |
+| `android.*` non-UI dependency | ⏭️ skip (consider extracting logic — see `--advise`) |
+| `*GeneratedTest.kt` | ⏭️ skip (agent's own output) |
+
+Stateful composables (`remember`/`mutableStateOf`) additionally get **metamorphic state-restoration tests**. UI tests respect the **layer boundary**: async/network success paths are tested at the ViewModel layer with fakes, never at the UI layer where real repositories can't run.
+
+## Incremental engine
+
+Every generated test file carries a state header on line 1:
+
+```kotlin
+// agenttest: hash=a3f8c2d1e9b4f7a2 status=passed
 ```
-Env variables still work and take priority.
 
-### Hide the agent code (binary plugin via mavenLocal)
-1. While `agentTest/` is still in the project, publish it once:
-   `./gradlew -p agentTest publishToMavenLocal`
-2. In root `settings.gradle.kts`, remove `includeBuild("agentTest")` and add
-   `mavenLocal()` FIRST in pluginManagement repositories.
-3. In `app/build.gradle.kts`: `id("com.ceylonapz.agenttest") version "1.0.0"`
-4. Delete the `agentTest/` folder from the project. Sync — code gone, task remains.
+| Situation | Behavior |
+|---|---|
+| status=passed, source hash unchanged | ⏩ skipped — zero LLM calls |
+| status=passed, source hash changed | ♻️ incremental — passing tests preserved, new tests added for the `git diff -U0` only |
+| broken/failed suite | 🧹 deleted, full regeneration |
+| no test file | full generation |
 
-### One-click runs (no terminal)
-Run → Edit Configurations → + → Gradle → Run: `:app:agentTest --llm=gemini`
-→ appears in the ▶ dropdown next to your app config. Also: Gradle panel →
-app → verification → agentTest (double-click).
+## Reading the results
+
+- ✅ **PASSED** — suite green; with `--mutate`, check the 🧬 score for suite strength
+- ❌ **FAILED_TESTS** — one or more tests fail. This is *information*, not noise. Three possibilities: **(a)** a genuine source bug (AgentTest's metamorphic tests have caught real state-loss and double-tap bugs), **(b)** a testability problem in the source (extract logic — see `--advise`), **(c)** a wrong LLM expectation. Review the FAILS section — links jump straight to the test method
+- 💥 **COMPILE_FAILED** — generation couldn't produce a compilable suite; see the linked log
+- 🔧 **NEEDS_SETUP** — missing test dependencies; paste the printed lines and re-run
+- 🐛 **suspected source bug(s)** — the suite passed but contains `// SUSPECTED CODE BUG:` markers worth reading
+
+---
+
+## Troubleshooting
+
+**`Plugin not found` on sync** — `mavenLocal()` is missing from `pluginManagement.repositories` in root `settings.gradle.kts` (it must be in `pluginManagement`, not `dependencyResolutionManagement`), or the plugin wasn't published (`ls ~/.m2/repository/com/ceylonapz/`).
+
+**Changes to the plugin don't take effect** — Gradle daemon cached the old jar. Re-publish with a version bump, or `./gradlew --stop` then re-run.
+
+**`Compilation failed in OTHER test files`** — a broken test file (not generated in this run) is blocking the module's test compilation. Fix or delete it; the agent only auto-cleans its own broken output.
+
+**`LLM call budget exhausted`** — the run hit `maxLlmCalls` (default 15). Raise it in the task config or split the run.
+
+**Robolectric `targetSdkVersion X > maxSdkVersion Y`** — add `app/src/test/resources/robolectric.properties` with `sdk=34`.
+
+**Gemini 404 model error** — the default model string may have been deprecated; update `GeminiClient.kt` and re-publish.
+
+**Nested build is slow on first run** — the agent runs tests in a nested Gradle build with a separate `--project-cache-dir` (avoids lock contention). The first run builds that cache; later runs reuse it.
+
+---
+
+## Cost
+
+Typical steady-state run: **1–2 LLM calls per changed target, zero for unchanged ones** — a multi-target run lands around 10–20K tokens (fractions of a cent on Gemini Flash). Every run ends with a real usage line (`💰 LLM usage: ...`) parsed from the API response, and `maxLlmCalls` caps worst-case spend. There is no test-failure repair loop by design: failures are reported, not iterated away with paid calls.
+
+## Privacy note
+
+Source code of targeted files is sent to your configured LLM provider (Google or Anthropic) using **your** API key. Don't run it on code you can't share with those providers, and never commit API keys.
+
+---
+
+## Roadmap
+
+- Instrumented tier: real device/emulator E2E tests (`--device`), deterministic smoke checks
+- Espresso generation for XML/hybrid apps
+- Gradle Plugin Portal publication (`id(...)` one-liner install, no mavenLocal)
+- PSI-grade planning via Kotlin compiler analysis
+- Provider A/B benchmarking reports
+
+---
+
+*Built by [CeylonAPZ](https://github.com/amalskr) — part of the Agent suite (HotFixAgent, AgentTest).*
